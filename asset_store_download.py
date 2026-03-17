@@ -10,6 +10,9 @@ from urllib.parse import unquote
 
 import requests
 
+from i18n import LANG_MAP, LANG_PROMPT, set_lang, t
+
+
 GRAPHQL_URL = "https://assetstore.unity.com/api/graphql/batch"
 DOWNLOAD_URL = "https://assetstore.unity.com/api/downloads"
 
@@ -246,7 +249,7 @@ fragment reviews on Reviews {
 """
 
 
-# ──────────────────── 工具函数 ────────────────────
+# ──────────────────── Utility functions ────────────────────
 
 
 def load_config(path="config.json"):
@@ -281,19 +284,17 @@ def make_graphql_headers(config, operations):
     }
 
 
-# ──────────────────── 获取列表 & 详情（逐页写入） ────────────────────
+# ──────────────────── Fetch list & details (write per page) ────────────────────
 
 
 def request_with_retry(method, url, retry, **kwargs):
-    """带重试的 HTTP 请求，遇到 5xx / 超时 / 连接错误自动重试"""
+    """HTTP request with retry on 5xx / timeout / connection errors."""
     for attempt in range(1, retry + 1):
         try:
             resp = method(url, **kwargs)
             if resp.status_code >= 500 and attempt < retry:
                 wait = 2**attempt
-                print(
-                    f"    服务器错误({resp.status_code})，{wait}秒后第{attempt}次重试..."
-                )
+                print(t("server_error").format(resp.status_code, wait, attempt))
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -301,7 +302,7 @@ def request_with_retry(method, url, retry, **kwargs):
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt < retry:
                 wait = 2**attempt
-                print(f"    网络错误，{wait}秒后第{attempt}次重试: {e}")
+                print(t("network_error").format(wait, attempt, e))
                 time.sleep(wait)
             else:
                 raise
@@ -363,7 +364,7 @@ def fetch_product_details(config, product_ids):
 
 
 def load_existing_list(list_path="asset_list.jsonl"):
-    """加载已有的 list jsonl，返回 {page: data} 字典"""
+    """Load existing list JSONL, return {page: data} dict."""
     pages = {}
     try:
         with open(list_path, "r", encoding="utf-8") as f:
@@ -379,7 +380,7 @@ def load_existing_list(list_path="asset_list.jsonl"):
 
 
 def load_existing_detail_ids(info_path="asset_info.jsonl"):
-    """加载已有的详情 jsonl，返回已获取的 product id 集合"""
+    """Load existing detail JSONL, return set of fetched product IDs."""
     ids = set()
     try:
         with open(info_path, "r", encoding="utf-8") as f:
@@ -397,7 +398,7 @@ def load_existing_detail_ids(info_path="asset_info.jsonl"):
 
 
 def append_list_page(page_num, page_data, f_list):
-    """将一页的 searchMyAssets 数据（含 page 字段）追加写入 jsonl"""
+    """Append one page of searchMyAssets data (with page field) to JSONL."""
     search_data = page_data[0]["data"]["searchMyAssets"]
     record = {**search_data, "page": page_num}
     f_list.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -405,7 +406,7 @@ def append_list_page(page_num, page_data, f_list):
 
 
 def append_detail_batch(details, f_info, f_ids, existing_ids):
-    """将一批详情结果追加写入 jsonl 和 ids 文件，返回写入条数"""
+    """Append a batch of detail results to JSONL and IDs file, return count written."""
     count = 0
     for item in details:
         product = item.get("data", {}).get("product")
@@ -423,7 +424,7 @@ def append_detail_batch(details, f_info, f_ids, existing_ids):
 
 
 def extract_product_ids_from_list(existing_pages):
-    """从已有的 list 数据中提取所有 product id（保持顺序）"""
+    """Extract all product IDs from existing list data (preserving order)."""
     seen = set()
     result = []
     for page_num in sorted(existing_pages.keys()):
@@ -435,11 +436,11 @@ def extract_product_ids_from_list(existing_pages):
     return result
 
 
-# ──────────────────── 下载 ────────────────────
+# ──────────────────── Download ────────────────────
 
 
 def load_size_map(info_path="asset_info.jsonl"):
-    """从 asset_info.jsonl 加载 {product_id: downloadSize} 映射"""
+    """Load {product_id: downloadSize} mapping from asset_info.jsonl."""
     size_map = {}
     try:
         with open(info_path, "r", encoding="utf-8") as f:
@@ -477,7 +478,7 @@ def format_eta(seconds):
     return f"{m:02d}:{s:02d}"
 
 
-# 用于多线程安全打印进度
+# Thread-safe lock for progress printing
 _print_lock = threading.Lock()
 
 
@@ -496,7 +497,7 @@ def print_progress(asset_id, filename, downloaded, total_size, speed, finished=F
     else:
         status = (
             f"  [{asset_id}] {filename}\n"
-            f"    已下载 {format_size(downloaded)}  {format_size(speed)}/s"
+            f"    {t('downloaded_no_total').format(format_size(downloaded), format_size(speed))}"
         )
     with _print_lock:
         if finished:
@@ -532,20 +533,14 @@ def download_asset(asset_id, config, download_dir, total_size=0):
 
     for attempt in range(1, retry + 1):
         try:
-            # 先发 HEAD/无Range 请求获取文件名，再决定断点续传
-            # 但为了减少请求，直接带 Range 发请求
-            # 如果 tmp 文件存在，尝试断点续传
+            # If a .tmp file exists, attempt to resume download
             tmp_path = None
             resumed_bytes = 0
 
-            # 先尝试不带 Range 请求来获取文件名（用已知的 tmp 文件匹配）
-            # 查找已有的 tmp 文件
-            existing_tmps = list(download_dir.glob(f"*.unitypackage.tmp"))
-            # 也需要检查完成文件
-            # 先发请求获取文件名
+            # Look up cached filename from meta file
             req_headers = dict(headers)
 
-            # 检查是否有该 asset_id 的 tmp 文件（通过元数据文件记录映射）
+            # Check for this asset_id's tmp file via metadata file mapping
             meta_path = download_dir / f".{asset_id}.meta"
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -553,7 +548,7 @@ def download_asset(asset_id, config, download_dir, total_size=0):
                 if cached_filename:
                     filepath = download_dir / cached_filename
                     if filepath.exists():
-                        return asset_id, True, f"已存在，跳过: {cached_filename}"
+                        return asset_id, True, t("exists_skip").format(cached_filename)
                     tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
                     if tmp_path.exists():
                         resumed_bytes = tmp_path.stat().st_size
@@ -564,27 +559,27 @@ def download_asset(asset_id, config, download_dir, total_size=0):
             resp = requests.get(url, headers=req_headers, stream=True, timeout=timeout)
 
             if resp.status_code == 401:
-                return asset_id, False, "Cookie已过期或无效(401)"
+                return asset_id, False, t("cookie_expired")
             if resp.status_code == 403:
-                return asset_id, False, "无权下载此资源(403)"
+                return asset_id, False, t("no_permission")
             if resp.status_code == 404:
-                return asset_id, False, "资源不存在(404)"
+                return asset_id, False, t("not_found")
 
-            # 416 Range Not Satisfiable — 文件已完整下载
+            # 416 Range Not Satisfiable — file already fully downloaded
             if resp.status_code == 416:
                 filename = parse_filename(resp, asset_id)
                 filepath = download_dir / filename
                 if tmp_path and tmp_path.exists():
                     tmp_path.rename(filepath)
                     meta_path.unlink(missing_ok=True)
-                    return asset_id, True, f"续传完成(已满): {filename}"
+                    return asset_id, True, t("resume_full").format(filename)
 
             resp.raise_for_status()
 
             filename = parse_filename(resp, asset_id)
             filepath = download_dir / filename
 
-            # 保存文件名映射，供断点续传使用
+            # Save filename mapping for resume support
             meta_path = download_dir / f".{asset_id}.meta"
             meta_path.write_text(
                 json.dumps({"filename": filename}, ensure_ascii=False),
@@ -593,20 +588,20 @@ def download_asset(asset_id, config, download_dir, total_size=0):
 
             if filepath.exists():
                 meta_path.unlink(missing_ok=True)
-                return asset_id, True, f"已存在，跳过: {filename}"
+                return asset_id, True, t("exists_skip").format(filename)
 
             tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
 
-            # 判断是否为续传响应
+            # Check if this is a resumed (partial content) response
             is_resumed = resp.status_code == 206
             if is_resumed:
                 mode = "ab"
             else:
-                # 服务器不支持 Range 或返回完整内容，从头开始
+                # Server doesn't support Range or returned full content, start from scratch
                 resumed_bytes = 0
                 mode = "wb"
 
-            # 确定总大小: 优先用已知的 total_size，其次用 Content-Range/Content-Length
+            # Determine total size: prefer known total_size, fallback to Content-Range/Content-Length
             effective_total = total_size
             if not effective_total:
                 content_range = resp.headers.get("Content-Range", "")
@@ -633,7 +628,7 @@ def download_asset(asset_id, config, download_dir, total_size=0):
                         asset_id, filename, downloaded, effective_total, speed
                     )
 
-            # 最终进度
+            # Final progress
             elapsed = time.time() - start_time
             speed = (downloaded - resumed_bytes) / elapsed if elapsed > 0 else 0
             print_progress(
@@ -643,29 +638,29 @@ def download_asset(asset_id, config, download_dir, total_size=0):
             tmp_path.rename(filepath)
             meta_path.unlink(missing_ok=True)
 
-            resumed_tag = " (续传)" if is_resumed else ""
+            resumed_tag = t("resumed") if is_resumed else ""
             return (
                 asset_id,
                 True,
-                f"完成{resumed_tag}: {filename} ({format_size(downloaded)})",
+                t("done").format(resumed_tag, filename, format_size(downloaded)),
             )
 
         except requests.RequestException as e:
             if attempt < retry:
                 wait = 2**attempt
                 with _print_lock:
-                    print(f"  [{asset_id}] 第{attempt}次失败，{wait}秒后重试: {e}")
+                    print(t("attempt_fail").format(asset_id, attempt, wait, e))
                 time.sleep(wait)
             else:
-                return asset_id, False, f"失败(重试{retry}次): {e}"
+                return asset_id, False, t("fail_retry").format(retry, e)
 
-    return asset_id, False, "未知错误"
+    return asset_id, False, t("unknown_error")
 
 
 def run_downloads(config, ids_path="asset_ids.txt"):
     asset_ids = load_asset_ids(ids_path)
     if not asset_ids:
-        print("asset_ids.txt 中没有有效的ID")
+        print(t("no_valid_ids"))
         return
 
     download_dir = Path(config.get("download_dir", "./downloads"))
@@ -676,10 +671,10 @@ def run_downloads(config, ids_path="asset_ids.txt"):
     known = sum(1 for aid in asset_ids if aid in size_map)
     total_known_size = sum(size_map.get(aid, 0) for aid in asset_ids)
 
-    print(f"\n共 {len(asset_ids)} 个资源，线程数: {max_workers}")
+    print(t("total_assets_threads").format(len(asset_ids), max_workers))
     if known > 0:
-        print(f"已知大小: {known} 个，总计 {format_size(total_known_size)}")
-    print(f"下载目录: {download_dir.resolve()}\n")
+        print(t("known_size").format(known, format_size(total_known_size)))
+    print(t("download_dir").format(download_dir.resolve()))
 
     success, failed = 0, 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -699,21 +694,21 @@ def run_downloads(config, ids_path="asset_ids.txt"):
             else:
                 failed += 1
 
-    print(f"\n下载完成: 成功 {success}, 失败 {failed}")
+    print(t("download_done").format(success, failed))
 
 
-# ──────────────────── 主流程 ────────────────────
+# ──────────────────── Main flow ────────────────────
 
 
 def _fetch_list_page_task(config, page, page_size):
-    """线程池任务: 获取单页列表"""
+    """Thread pool task: fetch a single list page."""
     page_data = fetch_asset_list_page(config, page, page_size)
     search_data = page_data[0]["data"]["searchMyAssets"]
     return page, {**search_data, "page": page}
 
 
 def _fetch_detail_batch_task(config, batch, batch_num):
-    """线程池任务: 获取一批详情"""
+    """Thread pool task: fetch a batch of product details."""
     details = fetch_product_details(config, batch)
     products = []
     for item in details:
@@ -731,30 +726,30 @@ def run_fetch_list(config, detail_batch_size=100):
     max_workers = config.get("max_workers", 3)
     _file_lock = threading.Lock()
 
-    # ── 阶段1: 补全列表（并发） ──
+    # ── Phase 1 ──
     print("=" * 50)
-    print("阶段1: 获取资源列表")
+    print(t("phase1"))
     print("=" * 50)
 
     existing_pages = load_existing_list(list_path)
     if existing_pages:
-        print(f"已有 {len(existing_pages)} 页列表数据")
+        print(t("existing_pages").format(len(existing_pages)))
 
     if 0 in existing_pages:
         total = existing_pages[0]["total"]
     else:
-        print("正在获取第 0 页以确定总数...")
+        print(t("fetching_page0"))
         first_page = fetch_asset_list_page(config, 0, page_size)
         total = first_page[0]["data"]["searchMyAssets"]["total"]
         record = {**first_page[0]["data"]["searchMyAssets"], "page": 0}
         with open(list_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         existing_pages[0] = record
-        print(f"  第 0 页已写入")
+        print(t("page_written"))
 
     total_pages = math.ceil(total / page_size)
     missing_pages = [p for p in range(total_pages) if p not in existing_pages]
-    print(f"共 {total} 个资源，{total_pages} 页，缺失 {len(missing_pages)} 页\n")
+    print(t("total_pages_missing").format(total, total_pages, len(missing_pages)))
 
     if missing_pages:
         with open(list_path, "a", encoding="utf-8") as f:
@@ -772,36 +767,36 @@ def run_fetch_list(config, detail_batch_size=100):
                             f.flush()
                             existing_pages[page_num] = record
                         with _print_lock:
-                            print(
-                                f"  第 {page_num}/{total_pages - 1} 页已写入 ({len(record.get('results', []))} 条)"
-                            )
+                            print(t("page_ok").format(
+                                page_num, total_pages - 1, len(record.get("results", []))
+                            ))
                     except requests.RequestException as e:
                         with _print_lock:
-                            print(f"  第 {page} 页获取失败: {e}")
+                            print(t("page_fail").format(page, e))
 
         still_missing = [p for p in range(total_pages) if p not in existing_pages]
         if still_missing:
-            print(f"\n仍有 {len(still_missing)} 页缺失: {still_missing}")
-            print("请重新运行以补全列表")
+            print(t("still_missing").format(len(still_missing), still_missing))
+            print(t("rerun"))
             return False
 
-    print(f"列表完整: {len(existing_pages)} 页")
+    print(t("list_complete").format(len(existing_pages)))
 
-    # ── 阶段2: 获取详情（并发，跳过已有） ──
+    # ── Phase 2 ──
     print("\n" + "=" * 50)
-    print("阶段2: 获取资源详情")
+    print(t("phase2"))
     print("=" * 50)
 
     all_product_ids = extract_product_ids_from_list(existing_pages)
     already_fetched = load_existing_detail_ids(info_path)
     pending_ids = [pid for pid in all_product_ids if pid not in already_fetched]
 
-    print(
-        f"共 {len(all_product_ids)} 个产品，已有详情 {len(already_fetched)} 个，待获取 {len(pending_ids)} 个\n"
-    )
+    print(t("detail_summary").format(
+        len(all_product_ids), len(already_fetched), len(pending_ids)
+    ))
 
     if not pending_ids:
-        print("详情数据已完整，无需获取")
+        print(t("detail_done"))
         return True
 
     existing_ids_in_file = set()
@@ -815,7 +810,6 @@ def run_fetch_list(config, detail_batch_size=100):
         pass
     existing_ids_in_file.update(already_fetched)
 
-    # 分批
     batches = []
     for i in range(0, len(pending_ids), detail_batch_size):
         batches.append(pending_ids[i : i + detail_batch_size])
@@ -847,30 +841,31 @@ def run_fetch_list(config, detail_batch_size=100):
                         f_ids.flush()
                     info_count += len(products)
                     with _print_lock:
-                        print(
-                            f"  批次 {batch_num}/{total_batches} 写入 {len(products)} 条详情"
-                        )
+                        print(t("batch_ok").format(batch_num, total_batches, len(products)))
                 except requests.RequestException as e:
                     with _print_lock:
-                        print(f"  批次 {batch_num}/{total_batches} 获取失败: {e}")
+                        print(t("batch_fail").format(batch_num, total_batches, e))
 
     final_detail_count = len(already_fetched) + info_count
-    print(f"\n详情数据: {info_path} (本次 +{info_count}，共 {final_detail_count} 条)")
-    print(f"ID文件: {ids_path} (共 {len(existing_ids_in_file)} 个)")
+    print(t("info_result").format(info_path, info_count, final_detail_count))
+    print(t("ids_result").format(ids_path, len(existing_ids_in_file)))
     return True
 
 
 def main():
+    lang_choice = input(LANG_PROMPT).strip()
+    set_lang(LANG_MAP.get(lang_choice, "en"))
+
     config = load_config()
 
-    print("Unity Asset Store 批量下载工具")
+    print(t("title"))
     print("=" * 40)
-    print("  1. 获取资源列表")
-    print("  2. 开始下载")
-    print("  3. 获取列表并下载")
+    print(t("menu_1"))
+    print(t("menu_2"))
+    print(t("menu_3"))
     print("=" * 40)
 
-    choice = input("请选择操作 [1/2/3]: ").strip()
+    choice = input(t("choose")).strip()
 
     if choice == "1":
         run_fetch_list(config)
@@ -882,7 +877,7 @@ def main():
             print("\n")
             run_downloads(config)
     else:
-        print("无效选择")
+        print(t("invalid_choice"))
 
 
 if __name__ == "__main__":
