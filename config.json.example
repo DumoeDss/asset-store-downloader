@@ -1,0 +1,7 @@
+{
+  "cookie": "",
+  "download_dir": "./downloads",
+  "max_workers": 3,
+  "retry": 3,
+  "timeout": 300
+}
