@@ -439,9 +439,9 @@ def extract_product_ids_from_list(existing_pages):
 # ──────────────────── Download ────────────────────
 
 
-def load_size_map(info_path="asset_info.jsonl"):
-    """Load {product_id: downloadSize} mapping from asset_info.jsonl."""
-    size_map = {}
+def load_info_map(info_path="asset_info.jsonl"):
+    """Load {product_id: {name, size}} mapping from asset_info.jsonl."""
+    info_map = {}
     try:
         with open(info_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -450,12 +450,14 @@ def load_size_map(info_path="asset_info.jsonl"):
                     continue
                 product = json.loads(line)
                 pid = str(product.get("id", ""))
-                ds = product.get("downloadSize")
-                if pid and ds:
-                    size_map[pid] = int(ds)
+                if pid:
+                    info_map[pid] = {
+                        "name": product.get("name", ""),
+                        "size": int(product.get("downloadSize") or 0),
+                    }
     except FileNotFoundError:
         pass
-    return size_map
+    return info_map
 
 
 def format_size(n):
@@ -530,26 +532,33 @@ def download_asset(asset_id, config, download_dir, total_size=0):
 
     timeout = config.get("timeout", 300)
     retry = config.get("retry", 3)
+    cache_dir = download_dir / ".cache"
+    cache_dir.mkdir(exist_ok=True)
+    meta_path = cache_dir / f"{asset_id}.meta"
+
+    # Check cached meta first — skip download without any network request
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_filename = meta.get("filename", "")
+        if cached_filename:
+            filepath = download_dir / cached_filename
+            if filepath.exists():
+                return asset_id, True, t("exists_skip").format(cached_filename)
 
     for attempt in range(1, retry + 1):
         try:
-            # If a .tmp file exists, attempt to resume download
             tmp_path = None
             resumed_bytes = 0
-
-            # Look up cached filename from meta file
             req_headers = dict(headers)
 
-            # Check for this asset_id's tmp file via metadata file mapping
-            meta_path = download_dir / f".{asset_id}.meta"
+            # Check for partially downloaded .tmp file via cached meta
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 cached_filename = meta.get("filename", "")
                 if cached_filename:
-                    filepath = download_dir / cached_filename
-                    if filepath.exists():
-                        return asset_id, True, t("exists_skip").format(cached_filename)
-                    tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
+                    tmp_path = (download_dir / cached_filename).with_suffix(
+                        (download_dir / cached_filename).suffix + ".tmp"
+                    )
                     if tmp_path.exists():
                         resumed_bytes = tmp_path.stat().st_size
 
@@ -571,7 +580,6 @@ def download_asset(asset_id, config, download_dir, total_size=0):
                 filepath = download_dir / filename
                 if tmp_path and tmp_path.exists():
                     tmp_path.rename(filepath)
-                    meta_path.unlink(missing_ok=True)
                     return asset_id, True, t("resume_full").format(filename)
 
             resp.raise_for_status()
@@ -579,15 +587,13 @@ def download_asset(asset_id, config, download_dir, total_size=0):
             filename = parse_filename(resp, asset_id)
             filepath = download_dir / filename
 
-            # Save filename mapping for resume support
-            meta_path = download_dir / f".{asset_id}.meta"
+            # Save filename mapping to cache for resume / skip support
             meta_path.write_text(
                 json.dumps({"filename": filename}, ensure_ascii=False),
                 encoding="utf-8",
             )
 
             if filepath.exists():
-                meta_path.unlink(missing_ok=True)
                 return asset_id, True, t("exists_skip").format(filename)
 
             tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
@@ -636,7 +642,6 @@ def download_asset(asset_id, config, download_dir, total_size=0):
             )
 
             tmp_path.rename(filepath)
-            meta_path.unlink(missing_ok=True)
 
             resumed_tag = t("resumed") if is_resumed else ""
             return (
@@ -657,6 +662,63 @@ def download_asset(asset_id, config, download_dir, total_size=0):
     return asset_id, False, t("unknown_error")
 
 
+def _build_local_file_index(download_dir):
+    """Build {lowercase_filename: Path} index of all .unitypackage files in download_dir."""
+    index = {}
+    for f in download_dir.glob("*.unitypackage"):
+        index[f.name.lower()] = f
+    return index
+
+
+def _pre_check_downloads(asset_ids, download_dir, cache_dir, info_map):
+    """Pre-check which assets are already downloaded locally, without any network request.
+
+    For each asset_id:
+      1. If .meta exists and the file exists (size verified) → skip
+      2. If no .meta, try to match a local file by product name from info_map → create .meta → skip
+      3. Otherwise → needs download
+
+    Returns (skipped: list[(id, filename)], pending: list[id]).
+    """
+    local_files = _build_local_file_index(download_dir)
+    skipped = []
+    pending = []
+
+    for aid in asset_ids:
+        meta_path = cache_dir / f"{aid}.meta"
+        info = info_map.get(aid, {})
+
+        # 1) Check existing .meta cache — .meta + file exists = already downloaded
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            cached_filename = meta.get("filename", "")
+            if cached_filename:
+                filepath = download_dir / cached_filename
+                if filepath.exists():
+                    skipped.append((aid, cached_filename))
+                    continue
+
+        # 2) No .meta — try to match local file by product name
+        product_name = info.get("name", "")
+        if product_name:
+            name_lower = product_name.lower()
+            for fname_lower, fpath in local_files.items():
+                if name_lower in fname_lower:
+                    # Create .meta cache for future runs
+                    meta_path.write_text(
+                        json.dumps({"filename": fpath.name}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    skipped.append((aid, fpath.name))
+                    break
+            else:
+                pending.append(aid)
+        else:
+            pending.append(aid)
+
+    return skipped, pending
+
+
 def run_downloads(config, ids_path="asset_ids.txt"):
     asset_ids = load_asset_ids(ids_path)
     if not asset_ids:
@@ -667,22 +729,49 @@ def run_downloads(config, ids_path="asset_ids.txt"):
     download_dir.mkdir(parents=True, exist_ok=True)
     max_workers = config.get("max_workers", 3)
 
-    size_map = load_size_map()
-    known = sum(1 for aid in asset_ids if aid in size_map)
-    total_known_size = sum(size_map.get(aid, 0) for aid in asset_ids)
+    # Migrate old .meta files from download_dir to download_dir/.cache/
+    cache_dir = download_dir / ".cache"
+    cache_dir.mkdir(exist_ok=True)
+    for old_meta in download_dir.glob(".*.meta"):
+        new_name = old_meta.name[1:]  # strip leading dot
+        new_path = cache_dir / new_name
+        if not new_path.exists():
+            old_meta.rename(new_path)
+        else:
+            old_meta.unlink()
 
+    info_map = load_info_map()
+
+    # Pre-check: skip already downloaded files without any network request
+    skipped, pending_ids = _pre_check_downloads(
+        asset_ids, download_dir, cache_dir, info_map
+    )
+
+    total_known_size = sum(info_map.get(aid, {}).get("size", 0) for aid in asset_ids)
     print(t("total_assets_threads").format(len(asset_ids), max_workers))
-    if known > 0:
-        print(t("known_size").format(known, format_size(total_known_size)))
+    if total_known_size > 0:
+        print(t("known_size").format(len(info_map), format_size(total_known_size)))
     print(t("download_dir").format(download_dir.resolve()))
 
-    success, failed = 0, 0
+    if skipped:
+        print(t("skipped_local").format(len(skipped)))
+    if not pending_ids:
+        print(t("all_skipped"))
+        return
+
+    print(t("pending_download").format(len(pending_ids)))
+
+    success, failed = len(skipped), 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(
-                download_asset, aid, config, download_dir, size_map.get(aid, 0)
+                download_asset,
+                aid,
+                config,
+                download_dir,
+                info_map.get(aid, {}).get("size", 0),
             ): aid
-            for aid in asset_ids
+            for aid in pending_ids
         }
         for future in as_completed(futures):
             asset_id, ok, msg = future.result()
