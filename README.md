@@ -1,38 +1,38 @@
-# Unity Asset Store Batch Downloader
+# Unity Asset Store 批量下载工具
 
-[中文](README_ZH.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
+[ENGLISH](README_EN.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
 
-Batch download all your purchased assets from Unity Asset Store.
+批量下载你在 Unity Asset Store 购买的所有资源。
 
-## Features
+## 功能特性
 
-- **Fetch asset list** via GraphQL API with pagination (100 per page)
-- **Fetch product details** for each asset (name, size, version, category, etc.)
-- **Batch download** `.unitypackage` files with thread pool concurrency
-- **Resume support** - interrupted downloads resume from where they left off
-- **Progress display** - real-time progress bar, speed, and ETA for each download
-- **Incremental fetch** - restart safely; already fetched pages/details are skipped
-- **Auto retry** - 5xx errors, timeouts, and connection errors retry with exponential backoff
+- **获取资源列表** - 通过 GraphQL API 分页获取（每页 100 条）
+- **获取产品详情** - 名称、大小、版本、分类等完整信息
+- **批量下载** - 线程池并发下载 `.unitypackage` 文件
+- **断点续传** - 中断后重新运行自动从上次位置继续下载
+- **下载进度** - 实时显示进度条、速度、剩余时间
+- **增量获取** - 重启后自动跳过已获取的页面和详情
+- **自动重试** - 5xx 错误、超时、连接错误自动指数退避重试
 
-## Requirements
+## 环境要求
 
 ```bash
 pip install requests
 ```
 
-## Setup
+## 配置
 
-1. Copy the example config:
+1. 复制示例配置文件：
    ```bash
    cp config.json.example config.json
    ```
-2. Log in to [Unity Asset Store](https://assetstore.unity.com) in your browser
-3. Open DevTools (F12) > Network tab > copy the `Cookie` header from any request
-4. Paste it into the `cookie` field of `config.json`:
+2. 在浏览器中登录 [Unity Asset Store](https://assetstore.unity.com)
+3. 打开开发者工具（F12）> Network 标签 > 复制任意请求的 `Cookie` 请求头
+4. 将 Cookie 粘贴到 `config.json` 的 `cookie` 字段：
 ![](pics/cookie.png)
 ```json
 {
-  "cookie": "your_cookie_string_here",
+  "cookie": "在此粘贴完整的cookie字符串",
   "download_dir": "./downloads",
   "max_workers": 3,
   "retry": 3,
@@ -40,39 +40,39 @@ pip install requests
 }
 ```
 
-| Field | Description |
+| 字段 | 说明 |
 |---|---|
-| `cookie` | Full cookie string from browser |
-| `download_dir` | Download save directory |
-| `max_workers` | Thread pool concurrency (recommended: 3) |
-| `retry` | Retry count for failed requests |
-| `timeout` | Request timeout in seconds |
+| `cookie` | 浏览器复制的完整 Cookie 字符串 |
+| `download_dir` | 下载保存目录 |
+| `max_workers` | 线程池并发数（建议 3，过大可能被限流） |
+| `retry` | 请求失败重试次数 |
+| `timeout` | 请求超时时间（秒） |
 
-## Usage
+## 使用方法
 
 ```bash
 python asset_store_download.py
 ```
 
-You will see a menu:
+启动后显示菜单：
 
 ```
-1. Fetch asset list      - Fetch list + details, write to JSONL files
-2. Start download        - Download .unitypackage files from asset_ids.txt
-3. Fetch list & download - Run both sequentially
+1. 获取资源列表      - 获取列表 + 详情，写入 JSONL 文件
+2. 开始下载          - 根据 asset_ids.txt 下载 .unitypackage 文件
+3. 获取列表并下载    - 依次执行以上两步
 ```
 
-## Output Files
+## 输出文件
 
-| File | Description |
+| 文件 | 说明 |
 |---|---|
-| `asset_list.jsonl` | One JSON per line, each line is a page's `searchMyAssets` data with a `page` field |
-| `asset_info.jsonl` | One JSON per line, each line is a product detail object |
-| `asset_ids.txt` | One product ID per line, used as download input |
-| `downloads/` | Downloaded `.unitypackage` files |
+| `asset_list.jsonl` | 每行一条 JSON，每页的 `searchMyAssets` 数据，含 `page` 字段 |
+| `asset_info.jsonl` | 每行一条 JSON，产品详情对象 |
+| `asset_ids.txt` | 每行一个产品 ID，作为下载输入 |
+| `downloads/` | 下载的 `.unitypackage` 文件 |
 
-## Resume Behavior
+## 断点续传机制
 
-- **List fetch**: reads `asset_list.jsonl`, detects missing pages, only fetches those
-- **Detail fetch**: reads `asset_info.jsonl`, skips already fetched product IDs
-- **File download**: detects `.tmp` files, sends `Range` header to resume from last byte
+- **列表获取**：读取 `asset_list.jsonl`，检测缺失页码，仅获取缺失页
+- **详情获取**：读取 `asset_info.jsonl`，跳过已有产品 ID
+- **文件下载**：检测 `.tmp` 文件，发送 `Range` 请求头从上次字节位置继续
